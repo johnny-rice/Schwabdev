@@ -37,8 +37,8 @@ class Tokens:
             raise ValueError("[Schwabdev] callback_url cannot be None.")
         if not tokens_db:
             raise ValueError("[Schwabdev] tokens_db cannot be None.")
-        if len(app_key) not in (32, 48) or len(app_secret) not in (16, 64):
-            raise ValueError("[Schwabdev] App key or app secret invalid length.")
+        if len(app_key) % 2 != 0 or len(app_secret) % 2 != 0 or len(app_key) + len(app_secret) < 32: # Schwab has several variations of key/secret lengths but they are always even and combined at least 32 chars.
+            raise ValueError("[Schwabdev] App key or app secret likely invalid.")
         if not callback_url.startswith("https"):
             raise ValueError("[Schwabdev] callback_url must be https.")
         if callback_url.endswith("/"):
@@ -320,12 +320,12 @@ class Tokens:
                 self._cur.execute("BEGIN EXCLUSIVE") # begin early and hold throughout all db/http to limit to one new access token across instances.
             except sqlite3.Error as e:
                 self._logger.error(f"[Schwabdev] Could not begin exclusive transaction ({e})")
-                return
+                return False
             self._load_tokens_from_db()
             if self._access_token_issued > last_known_at_issued and not overwrite:
                 self._logger.info(f"Access token updated elsewhere at {self._access_token_issued}.")
                 self._conn.rollback() # release exclusive
-                return
+                return True
 
             committed = False
 
@@ -336,19 +336,20 @@ class Tokens:
                 except requests.RequestException as e:
                     self._logger.error(f"[Schwabdev] Could not update access token (network error: {e})")
                     self._conn.rollback()  # release lock, no write performed
-                    return
+                    return False
                 if response.ok:
                     committed = self._set_tokens(now, self._refresh_token_issued, response.json())
                     self._logger.info(f"Access token updated at {self._access_token_issued}")
                 else:
                     self._logger.error(f"Could not get new access token; refresh_token likely invalid. ({response.text})")
                     self._conn.rollback()  # release lock, no write performed
-                    return
+                    return False
             except Exception as e:
                 self._logger.error(f"[Schwabdev] Could not update access token ({e})")
             finally:
                 if not committed:
                     self._conn.rollback()
+            return True
 
 
     """
@@ -400,19 +401,19 @@ class Tokens:
                 if last_known_rt_issued < now: # refresh token is invalid, is access token?
                     if self._access_token_issued < now: # refresh and access tokens are invalid.
                         self._logger.critical(f"Refresh token and Access token are invalid, couldn't get db lock ({e}).")
-                        return
+                        return False
                         #raise Exception("Refresh token and Access token are invalid, couldn't get db lock, cannot continue.")
                     else:
                         self._logger.warning("Access token valid, Refresh token invalid")
-                        return
+                        return False
                 else:
-                    return # still have time left (<30min), assume other client is updating.
+                    return False # still have time left (<30min), assume other client is updating.
             
             self._load_tokens_from_db()
             if self._refresh_token_issued > last_known_rt_issued and not overwrite:
                 self._logger.info(f"Refresh token updated elsewhere at {self._refresh_token_issued}.")
                 self._conn.rollback() # release exclusive
-                return
+                return True
 
             auth_url = f'https://api.schwabapi.com/v1/oauth/authorize?client_id={self._app_key}&redirect_uri={self._callback_url}'
 
@@ -436,10 +437,11 @@ class Tokens:
                 if len(auth_callback) < len(self._callback_url):
                     self._logger.error("No authorization URL provided, cannot continue.")
                     self._conn.rollback()
-                    return
+                    return False
 
             if self._set_tokens(now, now, _get_new_tokens(auth_callback)):
                 self._logger.info(f"Tokens updated at {now}")
+                return True
             else:
                 self._conn.rollback()
-
+                return False
